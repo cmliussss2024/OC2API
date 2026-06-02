@@ -262,12 +262,17 @@ async function fetchZen(zenReq, env, requestId, model, stream) {
 
 async function openAIFullResponse(upstream, env, requestId, model) {
 	const raw = await upstream.text();
+	const data = safeJsonParse(raw);
 	const zenError = parseZenError(raw);
 	logUpstreamBody(env, requestId, model, upstream.status, raw, zenError);
 
 	if (upstream.status === 429 || zenError) {
 		const details = zenErrorDetails(zenError, upstream.status);
 		return openAIErrorResponse(details.message, details.openaiType, details.status, details.code);
+	}
+
+	if (data?.choices) {
+		return jsonResponse(normalizeOpenAIFullData(data), upstream.status);
 	}
 
 	return new Response(raw, {
@@ -298,15 +303,60 @@ async function openAIStreamResponse(upstream, env, requestId, model) {
 		return openAIErrorResponse(details.message, details.openaiType, details.status, details.code);
 	}
 
+	const encoder = new TextEncoder();
+	const decoder = new TextDecoder();
+	const normalizer = createOpenAIStreamNormalizer();
+
 	const stream = new ReadableStream({
 		async start(controller) {
-			controller.enqueue(first.value);
+			let buffer = "";
+			let doneSent = false;
+
+			const enqueue = (text) => controller.enqueue(encoder.encode(text));
+			const sendData = (payload) => enqueue(`data: ${typeof payload === "string" ? payload : JSON.stringify(payload)}\n\n`);
+			const sendDone = () => {
+				if (doneSent) return;
+				doneSent = true;
+				sendData("[DONE]");
+			};
+			const processLine = (rawLine) => {
+				const line = rawLine.trimEnd();
+				if (!line.startsWith("data:")) return;
+
+				const payload = line.slice(5).trim();
+				if (!payload) return;
+				if (payload === "[DONE]") {
+					sendDone();
+					return;
+				}
+				if (doneSent) return;
+
+				const parsed = safeJsonParse(payload);
+				if (!parsed) return;
+
+				const normalized = normalizer.normalize(parsed);
+				if (normalized) sendData(normalized);
+			};
+			const processChunk = (chunk) => {
+				buffer += decoder.decode(chunk, { stream: true });
+				const lines = buffer.split("\n");
+				buffer = lines.pop() || "";
+				for (const line of lines) processLine(line);
+			};
+
 			try {
-				while (true) {
+				processChunk(first.value);
+				while (!doneSent) {
 					const { done, value } = await reader.read();
 					if (done) break;
-					controller.enqueue(value);
+					processChunk(value);
 				}
+
+				const tail = decoder.decode();
+				if (tail) buffer += tail;
+				if (buffer) processLine(buffer);
+				if (doneSent) await reader.cancel().catch(() => { });
+				sendDone();
 				controller.close();
 			} catch (error) {
 				controller.error(error);
@@ -321,6 +371,134 @@ async function openAIStreamResponse(upstream, env, requestId, model) {
 		status: upstream.status,
 		headers: mergeHeaders(SSE_HEADERS),
 	});
+}
+
+function normalizeOpenAIFullData(data) {
+	const next = { ...data };
+	if (!Array.isArray(next.choices)) return next;
+
+	next.choices = next.choices.map((choice) => {
+		if (!choice?.message) return choice;
+
+		const message = { ...choice.message };
+		normalizeReasoningField(message);
+
+		if (typeof message.content === "string") {
+			const reasoning = extractThinkBlocks(message.content);
+			if (reasoning && message.reasoning_content == null) message.reasoning_content = reasoning;
+
+			const visibleContent = stripThinkBlocks(message.content);
+			if (visibleContent !== message.content) message.content = visibleContent;
+		}
+
+		return { ...choice, message };
+	});
+
+	return next;
+}
+
+function createOpenAIStreamNormalizer() {
+	const contentStates = new Map();
+
+	return {
+		normalize(chunk) {
+			if (!chunk || !Array.isArray(chunk.choices)) return null;
+			if (!chunk.choices.length && chunk.cost != null) return null;
+
+			const next = { ...chunk };
+			delete next.cost;
+			next.choices = chunk.choices
+				.map((choice) => normalizeOpenAIStreamChoice(choice, contentStates))
+				.filter(Boolean);
+
+			if (!next.choices.length && !next.usage) return null;
+			return next;
+		},
+	};
+}
+
+function normalizeOpenAIStreamChoice(choice, contentStates) {
+	if (!choice?.delta) return choice;
+
+	const delta = { ...choice.delta };
+	normalizeReasoningField(delta);
+
+	if (typeof delta.content === "string") {
+		const state = getThinkState(contentStates, choice.index ?? 0);
+		const visibleContent = stripThinkStreamText(delta.content, state);
+		if (visibleContent) delta.content = visibleContent;
+		else delete delta.content;
+	}
+
+	if (!Object.keys(delta).length && !choice.finish_reason) return null;
+	return { ...choice, delta };
+}
+
+function normalizeReasoningField(target) {
+	if (!target || typeof target !== "object") return;
+	if (typeof target.reasoning === "string" && target.reasoning && target.reasoning_content == null) {
+		target.reasoning_content = target.reasoning;
+	}
+	delete target.reasoning;
+}
+
+function extractThinkBlocks(text) {
+	const matches = [];
+	const pattern = /<think>([\s\S]*?)<\/think>/gi;
+	let match;
+	while ((match = pattern.exec(text)) !== null) {
+		const content = match[1].trim();
+		if (content) matches.push(content);
+	}
+	return matches.join("\n");
+}
+
+function stripThinkBlocks(text) {
+	if (!/<\/?think>/i.test(text)) return text;
+	const state = createThinkState();
+	return stripThinkStreamText(text, state);
+}
+
+function getThinkState(states, key) {
+	const stateKey = String(key);
+	if (!states.has(stateKey)) states.set(stateKey, createThinkState());
+	return states.get(stateKey);
+}
+
+function createThinkState() {
+	return { inThink: false, emittedContent: false, removedThink: false };
+}
+
+function stripThinkStreamText(text, state) {
+	let output = "";
+	let cursor = 0;
+	const lower = text.toLowerCase();
+
+	while (cursor < text.length) {
+		if (state.inThink) {
+			const end = lower.indexOf("</think>", cursor);
+			if (end === -1) break;
+			cursor = end + "</think>".length;
+			state.inThink = false;
+			state.removedThink = true;
+			continue;
+		}
+
+		const start = lower.indexOf("<think>", cursor);
+		if (start === -1) {
+			output += text.slice(cursor);
+			break;
+		}
+
+		output += text.slice(cursor, start);
+		cursor = start + "<think>".length;
+		state.inThink = true;
+		state.removedThink = true;
+	}
+
+	if (state.removedThink && !state.emittedContent && output) output = output.replace(/^\s+/, "");
+	if (output) state.emittedContent = true;
+	return output;
 }
 
 async function anthropicFullResponse(upstream, model, inputTokens, env, requestId) {
@@ -339,7 +517,7 @@ async function anthropicFullResponse(upstream, model, inputTokens, env, requestI
 		return anthropicErrorResponse("Invalid upstream response", "upstream_error", 502);
 	}
 
-	return jsonResponse(openAIToAnthropic(data, model, inputTokens));
+	return jsonResponse(openAIToAnthropic(normalizeOpenAIFullData(data), model, inputTokens));
 }
 
 async function anthropicStreamResponse(upstream, model, inputTokens, env, requestId) {
@@ -375,6 +553,7 @@ async function anthropicStreamResponse(upstream, model, inputTokens, env, reques
 			let contentStarted = false;
 			let maxToolIdx = -1;
 			const openBlocks = new Set();
+			const contentStates = new Map();
 
 			const enqueue = (text) => controller.enqueue(encoder.encode(text));
 			const sendSSE = (event, data) => enqueue(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
@@ -448,17 +627,20 @@ async function anthropicStreamResponse(upstream, model, inputTokens, env, reques
 					if (!choice) continue;
 
 					const delta = choice.delta || {};
-					if (delta.content) {
-						if (!contentStarted) {
-							startBlock(0, { type: "text", text: "" });
-							contentStarted = true;
+					if (typeof delta.content === "string") {
+						const visibleContent = stripThinkStreamText(delta.content, getThinkState(contentStates, choice.index ?? 0));
+						if (visibleContent) {
+							if (!contentStarted) {
+								startBlock(0, { type: "text", text: "" });
+								contentStarted = true;
+							}
+							sendSSE("content_block_delta", {
+								type: "content_block_delta",
+								index: 0,
+								delta: { type: "text_delta", text: visibleContent },
+							});
+							outputTokens += Math.ceil(visibleContent.length / 4);
 						}
-						sendSSE("content_block_delta", {
-							type: "content_block_delta",
-							index: 0,
-							delta: { type: "text_delta", text: delta.content },
-						});
-						outputTokens += Math.ceil(delta.content.length / 4);
 					}
 
 					if (delta.tool_calls) {
