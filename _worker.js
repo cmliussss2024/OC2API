@@ -1,7 +1,8 @@
 const OC_VERSION = "1.15.13";
 const PROXY_VERSION = "9-worker";
-const ZEN_URL = "https://opencode.ai.cmliussss.net/zen/v1/chat/completions";
-const ZEN_MODELS_URL = "https://opencode.ai.cmliussss.net/zen/v1/models";
+const OPENCODE_URL = "https://opencode.ai.cmliussss.net";
+const OPENCODE_CHAT_COMPLETIONS_URL = OPENCODE_URL + "/zen/v1/chat/completions";
+const OPENCODE_MODELS_URL = OPENCODE_URL + "/zen/v1/models";
 const FETCH_TIMEOUT_MS = 120000;
 
 const userSessions = new Map();
@@ -57,21 +58,6 @@ async function handleOpenAI(request, env) {
 
 	const { model, messages, stream, tools, tool_choice } = input.body;
 
-	let models;
-	try {
-		models = await getAvailableModels(env);
-	} catch (error) {
-		debugLog(env, "[MODEL LIST ERROR]", { message: error?.message || String(error) });
-		return upstreamErrorResponse(error, "openai");
-	}
-
-	const availableModelIds = modelIds(models);
-	if (!availableModelIds.includes(model)) {
-		return jsonResponse({
-			error: { message: `Unknown model: ${model}. Available: ${availableModelIds.join(", ")}` },
-		}, 400);
-	}
-
 	const sessionId = getSession(auth.user);
 	const msgSummary = (messages || []).map((msg) => ({
 		role: msg.role,
@@ -108,23 +94,6 @@ async function handleAnthropic(request, env) {
 	if (input.error) return input.error;
 
 	const { model, stream } = input.body;
-
-	let models;
-	try {
-		models = await getAvailableModels(env);
-	} catch (error) {
-		debugLog(env, "[MODEL LIST ERROR]", { message: error?.message || String(error) });
-		return upstreamErrorResponse(error, "anthropic");
-	}
-
-	const availableModelIds = modelIds(models);
-	if (!availableModelIds.includes(model)) {
-		return anthropicErrorResponse(
-			`Unknown model: ${model}. Available: ${availableModelIds.join(", ")}`,
-			"invalid_request_error",
-			400,
-		);
-	}
 
 	const sessionId = getSession(auth.user);
 	const { messages, tools } = anthropicToOpenAI(input.body);
@@ -194,7 +163,7 @@ async function fetchZenModels(env) {
 
 	try {
 		const started = Date.now();
-		const response = await fetch(ZEN_MODELS_URL, {
+		const response = await fetch(OPENCODE_MODELS_URL, {
 			method: "GET",
 			headers: {
 				"Accept": "application/json",
@@ -235,10 +204,6 @@ function isAllowedModelId(id) {
 	return typeof id === "string" && (id === "big-pickle" || id.endsWith("-free"));
 }
 
-function modelIds(models) {
-	return models.map((model) => model.id);
-}
-
 function cachedModelCount() {
 	return Array.isArray(cachedModels) ? cachedModels.length : 0;
 }
@@ -268,7 +233,7 @@ async function fetchZen(zenReq, env, requestId, model, stream) {
 
 	try {
 		const started = Date.now();
-		const response = await fetch(ZEN_URL, {
+		const response = await fetch(OPENCODE_CHAT_COMPLETIONS_URL, {
 			method: "POST",
 			headers: zenReq.headers,
 			body: zenReq.body,
@@ -301,12 +266,8 @@ async function openAIFullResponse(upstream, env, requestId, model) {
 	logUpstreamBody(env, requestId, model, upstream.status, raw, zenError);
 
 	if (upstream.status === 429 || zenError) {
-		return openAIErrorResponse(
-			`${zenError?.message || "Rate limit exceeded"} (free model rate limit)`,
-			"rate_limit_error",
-			429,
-			"rate_limit_exceeded",
-		);
+		const details = zenErrorDetails(zenError, upstream.status);
+		return openAIErrorResponse(details.message, details.openaiType, details.status, details.code);
 	}
 
 	return new Response(raw, {
@@ -333,12 +294,8 @@ async function openAIStreamResponse(upstream, env, requestId, model) {
 	logUpstreamBody(env, requestId, model, upstream.status, firstText, zenError, true);
 	if (upstream.status === 429 || zenError) {
 		await reader.cancel().catch(() => { });
-		return openAIErrorResponse(
-			`${zenError?.message || "Rate limit exceeded"} (free model rate limit)`,
-			"rate_limit_error",
-			429,
-			"rate_limit_exceeded",
-		);
+		const details = zenErrorDetails(zenError, upstream.status);
+		return openAIErrorResponse(details.message, details.openaiType, details.status, details.code);
 	}
 
 	const stream = new ReadableStream({
@@ -373,8 +330,8 @@ async function anthropicFullResponse(upstream, model, inputTokens, env, requestI
 	logUpstreamBody(env, requestId, model, upstream.status, raw, zenError);
 
 	if (upstream.status === 429 || zenError || data?.error) {
-		const message = zenError?.message || data?.error?.message || "Rate limit exceeded";
-		return anthropicErrorResponse(`${message} (free model rate limit)`, "rate_limit_error", 429);
+		const details = zenErrorDetails(zenError || data?.error, upstream.status);
+		return anthropicErrorResponse(details.message, details.anthropicType, details.status);
 	}
 
 	if (!data?.choices) {
@@ -401,11 +358,8 @@ async function anthropicStreamResponse(upstream, model, inputTokens, env, reques
 	logUpstreamBody(env, requestId, model, upstream.status, firstText, zenError, true);
 	if (upstream.status === 429 || zenError) {
 		await reader.cancel().catch(() => { });
-		return anthropicErrorResponse(
-			`${zenError?.message || "Rate limit exceeded"} (free model rate limit)`,
-			"rate_limit_error",
-			429,
-		);
+		const details = zenErrorDetails(zenError, upstream.status);
+		return anthropicErrorResponse(details.message, details.anthropicType, details.status);
 	}
 
 	const encoder = new TextEncoder();
@@ -773,9 +727,9 @@ function authenticate(request, env, format = "openai") {
 		return { user: "anonymous" };
 	}
 
-	const apiKey = typeof env?.API_KEY === "string" ? env.API_KEY.trim() : "";
+	const apiKey = firstEnvValue(env, "API_KEY", "TOKEN");
 	if (!apiKey) {
-		const message = "No API key configured. Set Cloudflare secret or variable API_KEY.";
+		const message = "No API key configured. Set Cloudflare secret or variable API_KEY or TOKEN.";
 		return {
 			error: format === "anthropic"
 				? anthropicErrorResponse(message, "authentication_error", 500)
@@ -793,6 +747,14 @@ function authenticate(request, env, format = "openai") {
 			? anthropicErrorResponse("Invalid API key", "authentication_error", 401)
 			: openAIErrorResponse("Invalid API key", "authentication_error", 401),
 	};
+}
+
+function firstEnvValue(env, ...keys) {
+	for (const key of keys) {
+		const value = typeof env?.[key] === "string" ? env[key].trim() : "";
+		if (value) return value;
+	}
+	return "";
 }
 
 function getSession(user) {
@@ -823,15 +785,65 @@ async function readJson(request, format = "openai") {
 function parseZenError(raw) {
 	const text = String(raw || "").trim();
 	if (!text.startsWith("{")) return null;
-	if (!text.includes("FreeUsageLimitError") && !text.includes('"error"') && !text.includes('"type"')) return null;
 
 	const parsed = safeJsonParse(text);
-	if (!parsed || (!parsed.error && parsed.type !== "error")) return null;
+	if (!parsed || (!parsed.error && parsed.type !== "error" && typeof parsed.message !== "string")) return null;
 
 	return {
 		message: parsed.error?.message || parsed.message || "Rate limit exceeded",
 		type: parsed.error?.type || parsed.type || "upstream_error",
+		code: parsed.error?.code || parsed.code,
 	};
+}
+
+function zenErrorDetails(zenError, upstreamStatus) {
+	const message = zenError?.message || (upstreamStatus === 429 ? "Rate limit exceeded" : "Upstream error");
+
+	if (upstreamStatus === 429 || isFreeUsageError(zenError)) {
+		return {
+			message: `${message} (free model rate limit)`,
+			openaiType: "rate_limit_error",
+			anthropicType: "rate_limit_error",
+			status: 429,
+			code: "rate_limit_exceeded",
+		};
+	}
+
+	if (isModelUnsupportedError(zenError)) {
+		return {
+			message,
+			openaiType: "invalid_request_error",
+			anthropicType: "invalid_request_error",
+			status: clientErrorStatus(upstreamStatus, 400),
+			code: zenError?.code || "model_not_found",
+		};
+	}
+
+	return {
+		message,
+		openaiType: zenError?.type || "upstream_error",
+		anthropicType: zenError?.type || "upstream_error",
+		status: clientErrorStatus(upstreamStatus, 502),
+		code: zenError?.code,
+	};
+}
+
+function isFreeUsageError(error) {
+	const text = `${error?.type || ""} ${error?.code || ""} ${error?.message || ""}`.toLowerCase();
+	return text.includes("freeusagelimiterror") || text.includes("rate limit") || text.includes("quota");
+}
+
+function isModelUnsupportedError(error) {
+	const text = `${error?.type || ""} ${error?.code || ""} ${error?.message || ""}`.toLowerCase();
+	return text.includes("model_not_found")
+		|| text.includes("unknown model")
+		|| text.includes("unsupported model")
+		|| (text.includes("model") && text.includes("not found"))
+		|| (text.includes("model") && text.includes("not supported"));
+}
+
+function clientErrorStatus(status, fallback) {
+	return status >= 400 && status < 500 ? status : fallback;
 }
 
 function upstreamErrorResponse(error, format) {
