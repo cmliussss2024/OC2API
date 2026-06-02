@@ -29,29 +29,119 @@ const SSE_HEADERS = {
 	"X-Accel-Buffering": "no",
 };
 
-export default {
-	async fetch(request, env = process.env) {
-		if (request.method === "OPTIONS") {
-			return new Response(null, { status: 204, headers: CORS_HEADERS });
-		}
-
-		const url = new URL(request.url);
-		const path = url.pathname.replace(/\/+$/, "") || "/";
-
-		try {
-			if (request.method === "GET" && path === "/") return healthResponse();
-			if (request.method === "GET" && path === "/health") return healthResponse();
-			if (request.method === "GET" && path === "/v1/models") return modelsResponse();
-			if (request.method === "POST" && path === "/v1/chat/completions") return handleOpenAI(request, env);
-			if (request.method === "POST" && path === "/v1/messages") return handleAnthropic(request, env);
-
-			return jsonResponse({ error: { message: "Not found" } }, 404);
-		} catch (error) {
-			console.log("[FUNCTION ERROR]", error?.stack || error?.message || error);
-			return jsonResponse({ error: { message: "Internal error", type: "server_error" } }, 500);
-		}
+export const config = {
+	api: {
+		bodyParser: false,
 	},
 };
+
+export default async function handler(request, response) {
+	const fetchRequest = isWebRequest(request)
+		? request
+		: await nodeRequestToFetchRequest(request);
+	const fetchResponse = await handleRequest(fetchRequest, process.env);
+
+	if (!response) return fetchResponse;
+	return sendNodeResponse(response, fetchResponse);
+}
+
+async function handleRequest(request, env = process.env) {
+	if (request.method === "OPTIONS") {
+		return new Response(null, { status: 204, headers: CORS_HEADERS });
+	}
+
+	const url = new URL(request.url);
+	const path = url.pathname.replace(/\/+$/, "") || "/";
+
+	try {
+		if (request.method === "GET" && path === "/") return healthResponse();
+		if (request.method === "GET" && path === "/health") return healthResponse();
+		if (request.method === "GET" && path === "/v1/models") return modelsResponse();
+		if (request.method === "POST" && path === "/v1/chat/completions") return handleOpenAI(request, env);
+		if (request.method === "POST" && path === "/v1/messages") return handleAnthropic(request, env);
+
+		return jsonResponse({ error: { message: "Not found" } }, 404);
+	} catch (error) {
+		console.log("[FUNCTION ERROR]", error?.stack || error?.message || error);
+		return jsonResponse({ error: { message: "Internal error", type: "server_error" } }, 500);
+	}
+}
+
+function isWebRequest(request) {
+	return typeof request?.headers?.get === "function" && typeof request?.arrayBuffer === "function";
+}
+
+async function nodeRequestToFetchRequest(request) {
+	const headers = new Headers();
+	for (const [key, value] of Object.entries(request.headers || {})) {
+		if (Array.isArray(value)) {
+			for (const item of value) headers.append(key, item);
+		} else if (value !== undefined) {
+			headers.set(key, String(value));
+		}
+	}
+
+	const url = new URL(request.url || "/", nodeRequestOrigin(request));
+	const method = request.method || "GET";
+	const init = { method, headers };
+	if (method !== "GET" && method !== "HEAD") {
+		init.body = await readNodeRequestBody(request);
+		init.duplex = "half";
+	}
+
+	return new Request(url, init);
+}
+
+function nodeRequestOrigin(request) {
+	const forwardedProto = request.headers?.["x-forwarded-proto"];
+	const proto = Array.isArray(forwardedProto)
+		? forwardedProto[0]
+		: String(forwardedProto || "https").split(",")[0].trim();
+	const host = request.headers?.host || "localhost";
+	return `${proto || "https"}://${host}`;
+}
+
+async function readNodeRequestBody(request) {
+	if (request.body !== undefined && request.body !== null) {
+		if (typeof request.body === "string" || Buffer.isBuffer(request.body) || request.body instanceof Uint8Array) {
+			return request.body;
+		}
+		return JSON.stringify(request.body);
+	}
+
+	const chunks = [];
+	for await (const chunk of request) {
+		chunks.push(typeof chunk === "string" ? Buffer.from(chunk) : chunk);
+	}
+	return Buffer.concat(chunks);
+}
+
+async function sendNodeResponse(response, fetchResponse) {
+	response.statusCode = fetchResponse.status;
+	response.statusMessage = fetchResponse.statusText;
+	fetchResponse.headers.forEach((value, key) => {
+		response.setHeader(key, value);
+	});
+
+	if (!fetchResponse.body) {
+		response.end();
+		return;
+	}
+
+	const reader = fetchResponse.body.getReader();
+	try {
+		while (true) {
+			const { done, value } = await reader.read();
+			if (done) break;
+			if (!response.write(Buffer.from(value))) {
+				await new Promise((resolve) => response.once("drain", resolve));
+			}
+		}
+	} finally {
+		response.end();
+		reader.releaseLock();
+	}
+}
 
 async function handleOpenAI(request, env) {
 	const requestId = ocId("req");
