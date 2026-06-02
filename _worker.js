@@ -1,17 +1,11 @@
 const OC_VERSION = "1.15.13";
 const PROXY_VERSION = "9-worker";
 const ZEN_URL = "https://opencode.ai.cmliussss.net/zen/v1/chat/completions";
+const ZEN_MODELS_URL = "https://opencode.ai.cmliussss.net/zen/v1/models";
 const FETCH_TIMEOUT_MS = 120000;
 
-const MODELS = [
-	"deepseek-v4-flash-free",
-	"big-pickle",
-	"minimax-m3-free",
-	"nemotron-3-super-free",
-	"mimo-v2.5-free",
-];
-
 const userSessions = new Map();
+let cachedModels = null;
 
 const CORS_HEADERS = {
 	"Access-Control-Allow-Origin": "*",
@@ -41,7 +35,7 @@ export default {
 		try {
 			if (request.method === "GET" && path === "/") return healthResponse();
 			if (request.method === "GET" && path === "/health") return healthResponse();
-			if (request.method === "GET" && path === "/v1/models") return modelsResponse();
+			if (request.method === "GET" && path === "/v1/models") return modelsResponse(env);
 			if (request.method === "POST" && path === "/v1/chat/completions") return handleOpenAI(request, env);
 			if (request.method === "POST" && path === "/v1/messages") return handleAnthropic(request, env);
 
@@ -62,9 +56,19 @@ async function handleOpenAI(request, env) {
 	if (input.error) return input.error;
 
 	const { model, messages, stream, tools, tool_choice } = input.body;
-	if (!MODELS.includes(model)) {
+
+	let models;
+	try {
+		models = await getAvailableModels(env);
+	} catch (error) {
+		debugLog(env, "[MODEL LIST ERROR]", { message: error?.message || String(error) });
+		return upstreamErrorResponse(error, "openai");
+	}
+
+	const availableModelIds = modelIds(models);
+	if (!availableModelIds.includes(model)) {
 		return jsonResponse({
-			error: { message: `Unknown model: ${model}. Available: ${MODELS.join(", ")}` },
+			error: { message: `Unknown model: ${model}. Available: ${availableModelIds.join(", ")}` },
 		}, 400);
 	}
 
@@ -104,9 +108,19 @@ async function handleAnthropic(request, env) {
 	if (input.error) return input.error;
 
 	const { model, stream } = input.body;
-	if (!MODELS.includes(model)) {
+
+	let models;
+	try {
+		models = await getAvailableModels(env);
+	} catch (error) {
+		debugLog(env, "[MODEL LIST ERROR]", { message: error?.message || String(error) });
+		return upstreamErrorResponse(error, "anthropic");
+	}
+
+	const availableModelIds = modelIds(models);
+	if (!availableModelIds.includes(model)) {
 		return anthropicErrorResponse(
-			`Unknown model: ${model}. Available: ${MODELS.join(", ")}`,
+			`Unknown model: ${model}. Available: ${availableModelIds.join(", ")}`,
 			"invalid_request_error",
 			400,
 		);
@@ -141,21 +155,92 @@ function healthResponse() {
 	return jsonResponse({
 		status: "ok",
 		version: `v${PROXY_VERSION}`,
-		models: MODELS.length,
+		models: cachedModelCount(),
 		endpoints: ["/v1/chat/completions", "/v1/messages", "/v1/models"],
 	});
 }
 
-function modelsResponse() {
-	return jsonResponse({
-		object: "list",
-		data: MODELS.map((id) => ({
-			id,
-			object: "model",
-			created: 1779000000,
-			owned_by: "opencode-free",
-		})),
-	});
+async function modelsResponse(env) {
+	try {
+		return jsonResponse({
+			object: "list",
+			data: await getAvailableModels(env),
+		});
+	} catch (error) {
+		debugLog(env, "[MODEL LIST ERROR]", { message: error?.message || String(error) });
+		return upstreamErrorResponse(error, "openai");
+	}
+}
+
+async function getAvailableModels(env) {
+	if (cachedModels) return cachedModels;
+
+	cachedModels = fetchZenModels(env)
+		.then((models) => {
+			cachedModels = models;
+			return models;
+		})
+		.catch((error) => {
+			cachedModels = null;
+			throw error;
+		});
+
+	return cachedModels;
+}
+
+async function fetchZenModels(env) {
+	const controller = new AbortController();
+	const timeout = setTimeout(() => controller.abort("timeout"), FETCH_TIMEOUT_MS);
+
+	try {
+		const started = Date.now();
+		const response = await fetch(ZEN_MODELS_URL, {
+			method: "GET",
+			headers: {
+				"Accept": "application/json",
+				"Authorization": "Bearer public",
+				"User-Agent": `opencode/${OC_VERSION} ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.13`,
+			},
+			signal: controller.signal,
+		});
+		const raw = await response.text();
+		const parsed = safeJsonParse(raw);
+
+		if (!response.ok) throw new Error(`Model list returned HTTP ${response.status}`);
+		if (!Array.isArray(parsed?.data)) throw new Error("Invalid model list response");
+
+		const models = parsed.data
+			.filter((item) => isAllowedModelId(item?.id))
+			.map((item) => ({ ...item }));
+
+		if (!models.length) throw new Error("No allowed models returned from upstream");
+
+		debugLog(env, "[MODEL LIST]", {
+			status: response.status,
+			ms: Date.now() - started,
+			total: parsed.data.length,
+			allowed: models.length,
+		});
+
+		return models;
+	} catch (error) {
+		if (error?.name === "AbortError" || error === "timeout") throw new Error("timeout");
+		throw error;
+	} finally {
+		clearTimeout(timeout);
+	}
+}
+
+function isAllowedModelId(id) {
+	return typeof id === "string" && (id === "big-pickle" || id.endsWith("-free"));
+}
+
+function modelIds(models) {
+	return models.map((model) => model.id);
+}
+
+function cachedModelCount() {
+	return Array.isArray(cachedModels) ? cachedModels.length : 0;
 }
 
 function buildZenRequest(model, messages, stream, tools, toolChoice, sessionId) {
