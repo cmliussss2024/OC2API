@@ -1,8 +1,11 @@
-const OC_VERSION = "1.15.13";
+const OC_VERSION = "1.17.8";
 const PROXY_VERSION = "9-worker";
-const OPENCODE_URL = "https://opencode.ai.cmliussss.net";
-const OPENCODE_CHAT_COMPLETIONS_URL = OPENCODE_URL + "/zen/v1/chat/completions";
-const OPENCODE_MODELS_URL = OPENCODE_URL + "/zen/v1/models";
+const OPENCODE_URLs = [
+	"https://opencode.ai.cmliussss.net",
+	"https://opencode.fastly.cmliussss.net",
+	"https://opencode.gcore.cmliussss.net"
+]
+let OPENCODE_URL;
 const FETCH_TIMEOUT_MS = 120000;
 
 const userSessions = new Map();
@@ -32,7 +35,7 @@ export default {
 
 		const url = new URL(request.url);
 		const path = url.pathname.replace(/\/+$/, "") || "/";
-
+		if (!OPENCODE_URL) OPENCODE_URL = OPENCODE_URLs[Math.floor(Math.random() * OPENCODE_URLs.length)];
 		try {
 			if (request.method === "GET" && path === "/") return healthResponse();
 			if (request.method === "GET" && path === "/health") return healthResponse();
@@ -163,7 +166,7 @@ async function fetchZenModels(env) {
 
 	try {
 		const started = Date.now();
-		const response = await fetch(OPENCODE_MODELS_URL, {
+		const response = await fetch(OPENCODE_URL + "/zen/v1/models", {
 			method: "GET",
 			headers: {
 				"Accept": "application/json",
@@ -233,7 +236,7 @@ async function fetchZen(zenReq, env, requestId, model, stream) {
 
 	try {
 		const started = Date.now();
-		const response = await fetch(OPENCODE_CHAT_COMPLETIONS_URL, {
+		const response = await fetch(OPENCODE_URL + "/zen/v1/chat/completions", {
 			method: "POST",
 			headers: zenReq.headers,
 			body: zenReq.body,
