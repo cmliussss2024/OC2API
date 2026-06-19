@@ -5,7 +5,6 @@ const OPENCODE_URLs = [
 	"https://opencode.fastly.cmliussss.net",
 	"https://opencode.gcore.cmliussss.net"
 ]
-let OPENCODE_URL;
 const FETCH_TIMEOUT_MS = 120000;
 
 const userSessions = new Map();
@@ -35,7 +34,6 @@ export default {
 
 		const url = new URL(request.url);
 		const path = url.pathname.replace(/\/+$/, "") || "/";
-		if (!OPENCODE_URL) OPENCODE_URL = OPENCODE_URLs[Math.floor(Math.random() * OPENCODE_URLs.length)];
 		try {
 			if (request.method === "GET" && path === "/") return healthResponse();
 			if (request.method === "GET" && path === "/health") return healthResponse();
@@ -161,46 +159,39 @@ async function getAvailableModels(env) {
 }
 
 async function fetchZenModels(env) {
-	const controller = new AbortController();
-	const timeout = setTimeout(() => controller.abort("timeout"), FETCH_TIMEOUT_MS);
-
-	try {
-		const started = Date.now();
-		const response = await fetch(OPENCODE_URL + "/zen/v1/models", {
+	const response = await fetchZenWithFallback(
+		"/zen/v1/models",
+		() => ({
 			method: "GET",
 			headers: {
 				"Accept": "application/json",
 				"Authorization": "Bearer public",
 				"User-Agent": `opencode/${OC_VERSION} ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.13`,
 			},
-			signal: controller.signal,
-		});
-		const raw = await response.text();
-		const parsed = safeJsonParse(raw);
+		}),
+		env,
+		"model-list",
+	);
 
-		if (!response.ok) throw new Error(`Model list returned HTTP ${response.status}`);
-		if (!Array.isArray(parsed?.data)) throw new Error("Invalid model list response");
+	const raw = await response.text();
+	const parsed = safeJsonParse(raw);
 
-		const models = parsed.data
-			.filter((item) => isAllowedModelId(item?.id))
-			.map((item) => ({ ...item }));
+	if (!response.ok) throw new Error(`Model list returned HTTP ${response.status}`);
+	if (!Array.isArray(parsed?.data)) throw new Error("Invalid model list response");
 
-		if (!models.length) throw new Error("No allowed models returned from upstream");
+	const models = parsed.data
+		.filter((item) => isAllowedModelId(item?.id))
+		.map((item) => ({ ...item }));
 
-		debugLog(env, "[MODEL LIST]", {
-			status: response.status,
-			ms: Date.now() - started,
-			total: parsed.data.length,
-			allowed: models.length,
-		});
+	if (!models.length) throw new Error("No allowed models returned from upstream");
 
-		return models;
-	} catch (error) {
-		if (error?.name === "AbortError" || error === "timeout") throw new Error("timeout");
-		throw error;
-	} finally {
-		clearTimeout(timeout);
-	}
+	debugLog(env, "[MODEL LIST]", {
+		status: response.status,
+		total: parsed.data.length,
+		allowed: models.length,
+	});
+
+	return models;
 }
 
 function isAllowedModelId(id) {
@@ -209,6 +200,11 @@ function isAllowedModelId(id) {
 
 function cachedModelCount() {
 	return Array.isArray(cachedModels) ? cachedModels.length : 0;
+}
+
+function getOpencodeUrlsForRequest() {
+	const start = Math.floor(Math.random() * OPENCODE_URLs.length);
+	return [...OPENCODE_URLs.slice(start), ...OPENCODE_URLs.slice(0, start)];
 }
 
 function buildZenRequest(model, messages, stream, tools, toolChoice, sessionId) {
@@ -231,36 +227,80 @@ function buildZenRequest(model, messages, stream, tools, toolChoice, sessionId) 
 }
 
 async function fetchZen(zenReq, env, requestId, model, stream) {
-	const controller = new AbortController();
-	const timeout = setTimeout(() => controller.abort("timeout"), FETCH_TIMEOUT_MS);
-
-	try {
-		const started = Date.now();
-		const response = await fetch(OPENCODE_URL + "/zen/v1/chat/completions", {
+	return fetchZenWithFallback(
+		"/zen/v1/chat/completions",
+		() => ({
 			method: "POST",
 			headers: zenReq.headers,
 			body: zenReq.body,
-			signal: controller.signal,
-		});
-		logZenResponse(env, {
-			requestId,
-			model,
-			stream: !!stream,
-			status: response.status,
-			ok: response.ok,
-			ms: Date.now() - started,
-			contentType: response.headers.get("content-type"),
-			retryAfter: response.headers.get("retry-after"),
-			cfRay: response.headers.get("cf-ray"),
-			server: response.headers.get("server"),
-		});
-		return response;
-	} catch (error) {
-		if (error?.name === "AbortError" || error === "timeout") throw new Error("timeout");
-		throw error;
-	} finally {
-		clearTimeout(timeout);
+		}),
+		env,
+		requestId,
+		model,
+		stream,
+	);
+}
+
+async function fetchZenWithFallback(path, createInit, env, requestId, model, stream) {
+	let lastError = null;
+	const urls = getOpencodeUrlsForRequest();
+
+	for (let attempt = 0; attempt < urls.length; attempt++) {
+		const baseUrl = urls[attempt];
+		const controller = new AbortController();
+		const timeout = setTimeout(() => controller.abort("timeout"), FETCH_TIMEOUT_MS);
+
+		try {
+			const started = Date.now();
+			const response = await fetch(baseUrl + path, {
+				...createInit(),
+				signal: controller.signal,
+			});
+			logZenResponse(env, {
+				requestId,
+				model,
+				stream: !!stream,
+				attempt: attempt + 1,
+				source: baseUrl,
+				status: response.status,
+				ok: response.ok,
+				ms: Date.now() - started,
+				contentType: response.headers.get("content-type"),
+				retryAfter: response.headers.get("retry-after"),
+				cfRay: response.headers.get("cf-ray"),
+				server: response.headers.get("server"),
+			});
+
+			if (response.status >= 500) {
+				lastError = new Error(`Upstream returned HTTP ${response.status}`);
+				debugLog(env, "[ZEN RETRY]", {
+					requestId,
+					model,
+					stream: !!stream,
+					attempt: attempt + 1,
+					source: baseUrl,
+					message: lastError.message,
+				});
+				continue;
+			}
+
+			return response;
+		} catch (error) {
+			lastError = error?.name === "AbortError" || error === "timeout" ? new Error("timeout") : error;
+			debugLog(env, "[ZEN RETRY]", {
+				requestId,
+				model,
+				stream: !!stream,
+				attempt: attempt + 1,
+				source: baseUrl,
+				message: lastError?.message || String(lastError),
+			});
+		} finally {
+			clearTimeout(timeout);
+		}
 	}
+
+	throw lastError || new Error("Upstream error");
 }
 
 async function openAIFullResponse(upstream, env, requestId, model) {

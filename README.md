@@ -15,7 +15,7 @@ OC2API 是一个单文件 Cloudflare Worker 代理。它把 OpenAI 兼容接口�
 
 ## 上游地址
 
-聊天请求会转发到：
+聊天请求和模型列表请求会在下面这些上游之间自动容错切换：
 
 ```text
 https://opencode.ai.cmliussss.net/zen/v1/chat/completions
@@ -26,6 +26,8 @@ https://opencode.ai.cmliussss.net/zen/v1/chat/completions
 ```text
 https://opencode.ai.cmliussss.net/zen/v1/models
 ```
+
+实际运行时，Worker 会在每次请求时从这组地址里随机选择一个起点，然后按顺序依次尝试；如果当前上游出现异常或 5xx，会自动切到下一个，直到全部失败为止。
 
 Worker 访问上游时使用源码内置的 public bearer token 和 opencode 风格请求头。客户端访问 Worker 时，需要使用你自己配置的 `API_KEY` 或 `TOKEN`。
 
